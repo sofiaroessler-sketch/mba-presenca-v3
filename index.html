@@ -227,104 +227,360 @@ textarea.inp{resize:vertical;min-height:80px;line-height:1.6}
 <div id="root"></div>
 <script>
 
-// ═══════════════════════════════════════════════════════
-// GOOGLE CALENDAR — Authorization Code flow via Netlify Function
-// ═══════════════════════════════════════════════════════
-const GCAL_CLIENT_ID = '1087173576354-q5loa1ju912tj8bgoljnsrvt0ccg7ban.apps.googleusercontent.com';
-const GCAL_SCOPE = 'https://www.googleapis.com/auth/calendar.events';
+// ═══════════════════════════════════════════════════════════════════
+// SUPABASE — REST API direta (sem SDK pra evitar problemas com extensões)
+// ═══════════════════════════════════════════════════════════════════
+const SUPA_URL = 'https://rsnbhbmqwlbiwfrkwpie.supabase.co';
+const SUPA_KEY = 'sb_publishable_Zfvzy-pwGloc6dT6m-8G-Q_QN2UqZAO';
 
-function gcalSaveToken(uid, token, expiresIn) {
-  localStorage.setItem('gcal_' + uid, JSON.stringify({
-    token, expiry: Date.now() + (expiresIn - 120) * 1000
-  }));
+// Headers padrão pra REST API do Supabase
+function supaHeaders(extras) {
+  const h = {
+    'apikey': SUPA_KEY,
+    'Authorization': 'Bearer ' + SUPA_KEY,
+    'Content-Type': 'application/json',
+  };
+  if (extras) Object.assign(h, extras);
+  return h;
 }
-function gcalGetToken(uid) {
+
+// GET de todos os registros de uma tabela
+async function supaSelect(table, query='') {
+  const url = SUPA_URL + '/rest/v1/' + table + '?select=*' + (query ? '&' + query : '');
+  const r = await fetch(url, { headers: supaHeaders() });
+  if (!r.ok) throw new Error(table + ' SELECT: ' + r.status + ' ' + await r.text());
+  return await r.json();
+}
+
+// UPSERT em lote (Prefer: resolution=merge-duplicates)
+async function supaUpsert(table, rows, onConflict) {
+  if (!rows.length) return;
+  let url = SUPA_URL + '/rest/v1/' + table;
+  if (onConflict) url += '?on_conflict=' + encodeURIComponent(onConflict);
+  // Em batches de 100 (mais seguro pro PostgREST)
+  for (let i=0; i<rows.length; i+=100) {
+    const slice = rows.slice(i, i+100);
+    const r = await fetch(url, {
+      method: 'POST',
+      headers: supaHeaders({ 'Prefer': 'resolution=merge-duplicates,return=minimal' }),
+      body: JSON.stringify(slice),
+    });
+    if (!r.ok) {
+      const txt = await r.text();
+      throw new Error(table + ' UPSERT: ' + r.status + ' ' + txt);
+    }
+  }
+}
+
+// DELETE com filtro genérico (ex: "id=in.(a,b,c)" ou "turma=eq.T1&aula=eq.a1")
+async function supaDelete(table, filter) {
+  const url = SUPA_URL + '/rest/v1/' + table + '?' + filter;
+  const r = await fetch(url, {
+    method: 'DELETE',
+    headers: supaHeaders({ 'Prefer': 'return=minimal' }),
+  });
+  if (!r.ok) throw new Error(table + ' DELETE: ' + r.status + ' ' + await r.text());
+}
+
+// Flags
+let SUPA_READY = false;
+let SUPA_APPLYING_REMOTE = false;
+let _saveTimer = null;
+let _lastSnap = '';
+let _pollTimer = null;
+let _lastPollHash = '';
+
+async function supaLoadAll() {
   try {
-    const d = JSON.parse(localStorage.getItem('gcal_' + uid));
-    if (!d) return null;
-    if (Date.now() > d.expiry) { localStorage.removeItem('gcal_' + uid); return null; }
-    return d.token;
-  } catch { return null; }
+    const [alunosDb, presDb, reunDb, tarDb, datDb, faltaDb] = await Promise.all([
+      supaSelect('alunos'),
+      supaSelect('presencas'),
+      supaSelect('reunioes'),
+      supaSelect('tarefas'),
+      supaSelect('aulas_dates'),
+      supaSelect('falta_log'),
+    ]);
+
+    if (!alunosDb.length) {
+      // Seed inicial
+      console.log('[supa] banco vazio, fazendo seed inicial...');
+      await supaSeedFromEmbedded();
+      console.log('[supa] seed concluído!');
+      showToast('Banco populado com ' + state.alunos.length + ' médicos', 'ok');
+      SUPA_READY = true;
+      _lastSnap = JSON.stringify(supaSnap());
+      return true;
+    }
+
+    console.log('[supa] carregando dados do banco...');
+
+    // ALUNOS
+    const alunos = alunosDb.map(r => ({...r.dados, id: r.id}));
+    alunos.sort((a,b) => {
+      const na = parseInt((a.id||'').replace(/\D/g,'')) || 0;
+      const nb = parseInt((b.id||'').replace(/\D/g,'')) || 0;
+      return na - nb;
+    });
+
+    // PRESENCAS
+    const pres = {};
+    presDb.forEach(r => {
+      if (!pres[r.turma]) pres[r.turma] = {};
+      if (!pres[r.turma][r.aula]) pres[r.turma][r.aula] = {};
+      pres[r.turma][r.aula][r.aluno] = r.valor;
+    });
+
+    // REUNIOES
+    const reunByAluno = {};
+    reunDb.forEach(r => {
+      if (!reunByAluno[r.aluno_id]) reunByAluno[r.aluno_id] = [];
+      reunByAluno[r.aluno_id].push({...r.dados, id: r.id});
+    });
+    alunos.forEach(a => { a.reunioes = reunByAluno[a.id] || []; });
+
+    // TAREFAS
+    const tarefas = tarDb.map(r => ({...r.dados, id: r.id}));
+
+    // AULAS_DATES
+    const ad = {};
+    datDb.forEach(r => {
+      if (!ad[r.turma]) ad[r.turma] = {};
+      ad[r.turma][r.aula] = r.dados;
+    });
+
+    // FALTA_LOG
+    const fl = {};
+    faltaDb.forEach(r => {
+      if (!fl[r.aluno_id]) fl[r.aluno_id] = {};
+      fl[r.aluno_id][r.aula_id] = r.valores;
+    });
+
+    SUPA_APPLYING_REMOTE = true;
+    state.alunos = alunos;
+    state.presenca = pres;
+    state.tarefas = tarefas;
+    state.aulasDates = ad;
+    state.faltaLog = fl;
+    SUPA_APPLYING_REMOTE = false;
+
+    console.log(`[supa] carregados: ${alunos.length} alunos, ${presDb.length} presenças, ${reunDb.length} reuniões, ${tarefas.length} tarefas`);
+
+    SUPA_READY = true;
+    _lastSnap = JSON.stringify(supaSnap());
+    return true;
+  } catch (e) {
+    console.error('[supa] erro ao carregar:', e);
+    showToast('Erro ao carregar do banco: ' + (e.message||e), 'err');
+    SUPA_READY = false;
+    return false;
+  }
 }
-function gcalIsConnected(uid) { return !!gcalGetToken(uid); }
-function gcalDisconnect(uid) { localStorage.removeItem('gcal_' + uid); }
 
-function gcalConnect(uid) {
-  sessionStorage.setItem('gcal_uid', uid);
-  const params = new URLSearchParams({
-    client_id: GCAL_CLIENT_ID,
-    redirect_uri: window.location.origin + '/auth/callback',
-    response_type: 'code',
-    scope: GCAL_SCOPE,
-    access_type: 'offline',
-    prompt: 'consent',
+async function supaSeedFromEmbedded() {
+  const alunosRows = [];
+  const reunRows = [];
+  state.alunos.forEach(a => {
+    const reun = a.reunioes || [];
+    const c = {...a};
+    delete c.id;
+    delete c.reunioes;
+    alunosRows.push({ id: a.id, dados: c });
+    reun.forEach((r, idx) => {
+      const rc = {...r};
+      delete rc.id;
+      reunRows.push({
+        id: r.id || ('r_' + a.id + '_' + idx + '_' + Math.random().toString(36).slice(2,7)),
+        aluno_id: a.id,
+        dados: rc,
+      });
+    });
   });
-  const popup = window.open(
-    'https://accounts.google.com/o/oauth2/v2/auth?' + params,
-    'gcal', 'width=500,height=650,left=200,top=80'
-  );
-  if (!popup) { showToast('Popup bloqueado — permita popups e tente novamente', 'err'); return; }
-  window.addEventListener('message', function h(e) {
-    if (e.origin !== window.location.origin) return;
-    if (e.data?.type !== 'gcal_token') return;
-    window.removeEventListener('message', h);
-    if (e.data.error) { showToast('Erro: ' + e.data.error, 'err'); return; }
-    gcalSaveToken(uid, e.data.access_token, e.data.expires_in || 3600);
-    showToast('Google Calendar conectado! ✓', 'ok');
-    render();
+
+  const presRows = [];
+  Object.entries(state.presenca||{}).forEach(([turma, aulas]) => {
+    Object.entries(aulas).forEach(([aula, alunosMap]) => {
+      Object.entries(alunosMap).forEach(([aluno, valor]) => {
+        if (valor) presRows.push({ turma, aula, aluno, valor });
+      });
+    });
   });
+
+  const flRows = [];
+  Object.entries(state.faltaLog||{}).forEach(([aluno_id, aulas]) => {
+    Object.entries(aulas).forEach(([aula_id, valores]) => {
+      flRows.push({ aluno_id, aula_id, valores });
+    });
+  });
+
+  const adRows = [];
+  Object.entries(state.aulasDates||{}).forEach(([turma, aulas]) => {
+    Object.entries(aulas).forEach(([aula, dados]) => {
+      adRows.push({ turma, aula, dados });
+    });
+  });
+
+  const tarRows = (state.tarefas||[]).map(t => {
+    const c = {...t};
+    delete c.id;
+    return { id: t.id || 't_'+Date.now(), dados: c };
+  });
+
+  // Insert sequencial pra não estourar nada
+  await supaUpsert('alunos', alunosRows, 'id');
+  await supaUpsert('reunioes', reunRows, 'id');
+  if (presRows.length) await supaUpsert('presencas', presRows, 'turma,aula,aluno');
+  if (flRows.length)   await supaUpsert('falta_log', flRows, 'aluno_id,aula_id');
+  if (adRows.length)   await supaUpsert('aulas_dates', adRows, 'turma,aula');
+  if (tarRows.length)  await supaUpsert('tarefas', tarRows, 'id');
 }
 
-// Chamado quando esta página é o /auth/callback
-(function() {
-  if (window.location.pathname !== '/auth/callback') return;
-  const code = new URLSearchParams(window.location.search).get('code');
-  const error = new URLSearchParams(window.location.search).get('error');
-  if (error) { window.opener?.postMessage({type:'gcal_token',error}, window.location.origin); window.close(); return; }
-  if (!code) return;
-  fetch('/.netlify/functions/gcal-token', {
-    method: 'POST',
-    headers: {'Content-Type':'application/json'},
-    body: JSON.stringify({code, redirect_uri: window.location.origin + '/auth/callback'})
-  }).then(r=>r.json()).then(d=>{
-    window.opener?.postMessage({type:'gcal_token',...d}, window.location.origin);
-    window.close();
-  }).catch(e=>{
-    window.opener?.postMessage({type:'gcal_token',error:e.message}, window.location.origin);
-    window.close();
-  });
-})();
-
-async function gcalCreateEvent(uid, event) {
-  const token = gcalGetToken(uid);
-  if (!token) return null;
-  const res = await fetch('https://www.googleapis.com/calendar/v3/calendars/primary/events', {
-    method: 'POST',
-    headers: {'Authorization':'Bearer '+token,'Content-Type':'application/json'},
-    body: JSON.stringify(event)
-  });
-  if (res.status === 401) { gcalDisconnect(uid); showToast('Reconecte o Google Calendar', 'err'); return null; }
-  return res.json();
-}
-
-function gcalEventReuniao(reuniao, aluno) {
+function supaSnap() {
   return {
-    summary: `${reuniao.tipo} · ${aluno.nome.split(' ').slice(0,2).join(' ')}`,
-    description: ['Tipo: '+reuniao.tipo,'Turma: '+(aluno.turma||''),
-      aluno.whatsapp?'WhatsApp: '+aluno.whatsapp:'',
-      reuniao.notas?'Notas: '+reuniao.notas:''].filter(Boolean).join('\n'),
-    start:{date:reuniao.data}, end:{date:reuniao.data},
-    reminders:{useDefault:false,overrides:[{method:'popup',minutes:60}]}
+    alunos: state.alunos,
+    presenca: state.presenca,
+    tarefas: state.tarefas,
+    aulasDates: state.aulasDates,
+    faltaLog: state.faltaLog,
   };
 }
 
-function gcalEventAula(aulaLabel, turmaLabel, data) {
-  return {
-    summary: `Aula · ${aulaLabel} — ${turmaLabel}`,
-    description: `Turma ${turmaLabel} · ${aulaLabel}`,
-    start:{date:data}, end:{date:data},
-    reminders:{useDefault:false,overrides:[{method:'popup',minutes:60}]}
-  };
+function supaSaveDebounced() {
+  if (!SUPA_READY || SUPA_APPLYING_REMOTE) return;
+  const snap = JSON.stringify(supaSnap());
+  if (snap === _lastSnap) return;
+  _lastSnap = snap;
+  clearTimeout(_saveTimer);
+  _saveTimer = setTimeout(() => supaSaveAll().catch(e => {
+    console.error('[supa] save erro:', e);
+    showToast('Erro ao salvar: ' + (e.message||e), 'err');
+  }), 800);
+}
+
+async function supaSaveAll() {
+  // ALUNOS
+  const alunosRows = state.alunos.map(a => {
+    const c = {...a};
+    delete c.id;
+    delete c.reunioes;
+    return { id: a.id, dados: c };
+  });
+
+  // REUNIOES (com IDs)
+  const reunRows = [];
+  const reunIds = new Set();
+  state.alunos.forEach(a => {
+    (a.reunioes||[]).forEach(r => {
+      if (!r.id) r.id = 'r_' + a.id + '_' + Date.now() + '_' + Math.random().toString(36).slice(2,7);
+      reunIds.add(r.id);
+      const c = {...r};
+      delete c.id;
+      reunRows.push({ id: r.id, aluno_id: a.id, dados: c });
+    });
+  });
+
+  // PRESENCAS
+  const presRows = [];
+  Object.entries(state.presenca||{}).forEach(([turma, aulas]) => {
+    Object.entries(aulas).forEach(([aula, alunosMap]) => {
+      Object.entries(alunosMap).forEach(([aluno, valor]) => {
+        if (valor) presRows.push({ turma, aula, aluno, valor });
+      });
+    });
+  });
+
+  // FALTA_LOG
+  const flRows = [];
+  Object.entries(state.faltaLog||{}).forEach(([aluno_id, aulas]) => {
+    Object.entries(aulas).forEach(([aula_id, valores]) => {
+      flRows.push({ aluno_id, aula_id, valores });
+    });
+  });
+
+  // AULAS_DATES
+  const adRows = [];
+  Object.entries(state.aulasDates||{}).forEach(([turma, aulas]) => {
+    Object.entries(aulas).forEach(([aula, dados]) => {
+      adRows.push({ turma, aula, dados });
+    });
+  });
+
+  // TAREFAS
+  const tarRows = [];
+  const tarIds = new Set();
+  (state.tarefas||[]).forEach(t => {
+    if (!t.id) t.id = 't_' + Date.now() + '_' + Math.random().toString(36).slice(2,7);
+    tarIds.add(t.id);
+    const c = {...t};
+    delete c.id;
+    tarRows.push({ id: t.id, dados: c });
+  });
+
+  // Buscar o que tem no banco pra detectar deleções
+  const [dbReun, dbTar, dbPres] = await Promise.all([
+    supaSelect('reunioes', 'select=id'),
+    supaSelect('tarefas', 'select=id'),
+    supaSelect('presencas', 'select=turma,aula,aluno'),
+  ]);
+
+  const reunDelete = dbReun.filter(r => !reunIds.has(r.id)).map(r => r.id);
+  const tarDelete  = dbTar.filter(t => !tarIds.has(t.id)).map(t => t.id);
+  const presKeysAtuais = new Set(presRows.map(r => r.turma+'/'+r.aula+'/'+r.aluno));
+  const presDelete = dbPres.filter(r => !presKeysAtuais.has(r.turma+'/'+r.aula+'/'+r.aluno));
+
+  // Upserts em paralelo
+  await Promise.all([
+    supaUpsert('alunos', alunosRows, 'id'),
+    supaUpsert('reunioes', reunRows, 'id'),
+    supaUpsert('tarefas', tarRows, 'id'),
+    supaUpsert('aulas_dates', adRows, 'turma,aula'),
+    supaUpsert('falta_log', flRows, 'aluno_id,aula_id'),
+    supaUpsert('presencas', presRows, 'turma,aula,aluno'),
+  ]);
+
+  // Deletes
+  if (reunDelete.length) {
+    await supaDelete('reunioes', 'id=in.(' + reunDelete.map(id => '"'+id+'"').join(',') + ')');
+  }
+  if (tarDelete.length) {
+    await supaDelete('tarefas', 'id=in.(' + tarDelete.map(id => '"'+id+'"').join(',') + ')');
+  }
+  // Presenças removidas — deleta uma por uma (raro acontecer)
+  for (const r of presDelete) {
+    await supaDelete('presencas', `turma=eq.${encodeURIComponent(r.turma)}&aula=eq.${encodeURIComponent(r.aula)}&aluno=eq.${encodeURIComponent(r.aluno)}`);
+  }
+
+  console.log('[supa] salvo!');
+}
+
+// Polling leve a cada 15s pra detectar mudanças de outros usuários
+function supaStartPolling() {
+  clearInterval(_pollTimer);
+  _pollTimer = setInterval(async () => {
+    if (!SUPA_READY) return;
+    if (_saveTimer) return; // estamos prestes a salvar — não recarrega
+    try {
+      // Hash rápido: conta linhas de cada tabela
+      const [a, p, r, t] = await Promise.all([
+        fetch(SUPA_URL + '/rest/v1/alunos?select=id', { headers: supaHeaders({Prefer:'count=exact'}) }),
+        fetch(SUPA_URL + '/rest/v1/presencas?select=turma', { headers: supaHeaders({Prefer:'count=exact'}) }),
+        fetch(SUPA_URL + '/rest/v1/reunioes?select=id', { headers: supaHeaders({Prefer:'count=exact'}) }),
+        fetch(SUPA_URL + '/rest/v1/tarefas?select=id', { headers: supaHeaders({Prefer:'count=exact'}) }),
+      ]);
+      // Usa Content-Range header pra contar
+      const sig = [a,p,r,t].map(x => x.headers.get('content-range') || '').join('|');
+      if (_lastPollHash && _lastPollHash !== sig) {
+        console.log('[supa] mudança detectada, recarregando...');
+        await supaLoadAll();
+        render();
+      }
+      _lastPollHash = sig;
+    } catch(e) { /* silencia erro de polling */ }
+  }, 15000);
+}
+
+async function supaBoot() {
+  const ok = await supaLoadAll();
+  if (ok) supaStartPolling();
 }
 
 // ═══════════════════════════════════════════════════════
@@ -344,6 +600,145 @@ const PROFILES = [
   {id:'bruna',   name:'Bruna',    email:''},
 ];
 // ── Google OAuth config ──────────────────────────────────────
+const GCAL_CLIENT_ID = '108857966505-dohj12kc877ko21ersre2tqdl67ognf6.apps.googleusercontent.com';
+const GCAL_SCOPES    = 'https://www.googleapis.com/auth/calendar.events';
+
+// Token store: { userId → {access_token, expiry} }
+// Persisted in localStorage so sobrevive ao F5
+function gcalGetToken(uid) {
+  try {
+    const raw = localStorage.getItem('gcal_token_' + uid);
+    if (!raw) return null;
+    const t = JSON.parse(raw);
+    if (Date.now() > t.expiry) { localStorage.removeItem('gcal_token_' + uid); return null; }
+    return t.access_token;
+  } catch { return null; }
+}
+function gcalSetToken(uid, access_token, expires_in) {
+  localStorage.setItem('gcal_token_' + uid, JSON.stringify({
+    access_token,
+    expiry: Date.now() + (expires_in - 60) * 1000
+  }));
+}
+function gcalIsConnected(uid) { return !!gcalGetToken(uid); }
+
+// Abre popup OAuth com Authorization Code Flow
+// Fluxo: popup → Google → /auth/callback?code=... → Netlify Function troca por token
+const GCAL_REDIRECT = 'https://mba-exp-v3.netlify.app/auth/callback';
+
+function gcalConnect(uid) {
+  return new Promise((resolve, reject) => {
+    const params = new URLSearchParams({
+      client_id: GCAL_CLIENT_ID,
+      redirect_uri: GCAL_REDIRECT,
+      response_type: 'code',
+      scope: GCAL_SCOPES,
+      prompt: 'consent',
+      access_type: 'offline',
+      state: uid,
+    });
+    const url = 'https://accounts.google.com/o/oauth2/v2/auth?' + params;
+    const popup = window.open(url, 'gcal_auth', 'width=500,height=650,left=200,top=100');
+    if (!popup) { reject(new Error('Popup bloqueado — permita pop-ups deste site')); return; }
+
+    // Monitora o popup esperando ele voltar pra /auth/callback?code=...
+    const timer = setInterval(async () => {
+      try {
+        if (popup.closed) { clearInterval(timer); reject(new Error('Popup fechado')); return; }
+        // Tentativa de ler a URL — se for cross-origin, joga exceção e a gente espera
+        const href = popup.location.href;
+        if (!href || !href.includes('code=')) return;
+
+        // Pegou o code! Para o timer, fecha popup
+        clearInterval(timer);
+        const u = new URL(href);
+        const code = u.searchParams.get('code');
+        const err  = u.searchParams.get('error');
+        popup.close();
+
+        if (err) { reject(new Error('Google retornou erro: ' + err)); return; }
+        if (!code) { reject(new Error('Sem code na resposta')); return; }
+
+        // Troca o code por access_token via Netlify Function
+        const r = await fetch('/.netlify/functions/gcal-token', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ code, redirect_uri: GCAL_REDIRECT }),
+        });
+        if (!r.ok) {
+          const txt = await r.text();
+          reject(new Error('Falha ao trocar code por token: ' + txt));
+          return;
+        }
+        const data = await r.json();
+        if (!data.access_token) {
+          reject(new Error('Resposta sem access_token: ' + JSON.stringify(data)));
+          return;
+        }
+        gcalSetToken(uid, data.access_token, data.expires_in || 3600);
+        resolve(data.access_token);
+      } catch (e) {
+        // Cross-origin enquanto está no domínio do Google — ignora e tenta de novo
+      }
+    }, 500);
+  });
+}
+
+// Cria um evento no Google Calendar do usuário
+async function gcalCreateEvent(uid, event) {
+  let token = gcalGetToken(uid);
+  if (!token) {
+    showToast('Conecte o Google Calendar primeiro', 'err');
+    return null;
+  }
+  try {
+    const res = await fetch('https://www.googleapis.com/calendar/v3/calendars/primary/events', {
+      method: 'POST',
+      headers: { Authorization: 'Bearer ' + token, 'Content-Type': 'application/json' },
+      body: JSON.stringify(event),
+    });
+    if (res.status === 401) {
+      localStorage.removeItem('gcal_token_' + uid);
+      showToast('Token expirado — reconecte o Google Calendar', 'err');
+      return null;
+    }
+    const data = await res.json();
+    return data;
+  } catch(e) {
+    console.error('gcalCreateEvent error', e);
+    return null;
+  }
+}
+
+// Monta um evento de reunião para a API do Google
+function gcalBuildReuniaoEvent(reuniao, aluno) {
+  const date = reuniao.data; // YYYY-MM-DD
+  const resp = PROFILES.find(p=>p.id===reuniao.responsavelId);
+  const title = `${reuniao.tipo} · ${aluno.nome.split(' ').slice(0,2).join(' ')}`;
+  return {
+    summary: title,
+    description: [
+      reuniao.tipo,
+      'Turma: ' + (aluno.turma||''),
+      aluno.whatsapp ? 'WhatsApp: ' + aluno.whatsapp : '',
+      reuniao.notas  ? 'Notas: ' + reuniao.notas : '',
+    ].filter(Boolean).join('\n'),
+    start: { date },
+    end:   { date },
+    reminders: { useDefault: false, overrides: [{method:'popup', minutes:60}] },
+  };
+}
+
+// Monta um evento de aula para a API do Google
+function gcalBuildAulaEvent(aulaLabel, turmaLabel, data) {
+  return {
+    summary: `Aula · ${aulaLabel} · ${turmaLabel}`,
+    description: `Turma ${turmaLabel} — ${aulaLabel}`,
+    start: { date: data },
+    end:   { date: data },
+    reminders: { useDefault: false, overrides: [{method:'popup', minutes:60}] },
+  };
+}
 // Permission helpers — no labels ever shown in UI
 const GOD_MODE   = ['ygor','bruna'];
 const MEDICOS_INT= ['matheus','simone','isabella']; // do reunião individual
@@ -606,6 +1001,7 @@ const I = {
 // ═══════════════════════════════════════════════════════
 let _rafPending = false;
 function render() {
+  if (typeof supaSaveDebounced === 'function') supaSaveDebounced();
   if (_rafPending) return;
   _rafPending = true;
   requestAnimationFrame(() => {
@@ -1954,18 +2350,22 @@ function attachEvents() {
   });
 
   // Logout
-
-  // Google Calendar
-  document.querySelector('[data-gcal-connect]')?.addEventListener('click', () => {
-    const uid = state.user?.id;
-    if (uid) gcalConnect(uid);
-  });
-  document.querySelector('[data-gcal-disconnect]')?.addEventListener('click', () => {
+  // Google Calendar connect
+  document.querySelector('[data-gcal-connect]')?.addEventListener('click', async () => {
     const uid = state.user?.id;
     if (!uid) return;
-    gcalDisconnect(uid);
-    showToast('Google Calendar desconectado', 'ok');
-    render();
+    if (gcalIsConnected(uid)) {
+      showToast('Google Calendar já conectado! ✓', 'ok');
+      return;
+    }
+    showToast('Abrindo autorização do Google...', 'ok');
+    try {
+      await gcalConnect(uid);
+      showToast('Google Calendar conectado com sucesso! ✓', 'ok');
+      render();
+    } catch(e) {
+      showToast('Erro ao conectar: ' + e.message, 'err');
+    }
   });
 
   document.querySelector('[data-logout]')?.addEventListener('click', () => {
@@ -2762,10 +3162,15 @@ function salvarReuniao() {
   showToast('Reunião agendada para ' + fmt(data));
   render();
 
-  // Google Calendar
-  if (respId && data && gcalIsConnected(respId)) {
-    gcalCreateEvent(respId, gcalEventReuniao(reu, a))
-      .then(ev => { if (ev?.id) showToast('Evento criado no Google Calendar ✓', 'ok'); });
+  // Criar evento no Google Calendar do responsável
+  if (respId && data) {
+    const token = gcalGetToken(respId);
+    if (token) {
+      const event = gcalBuildReuniaoEvent(reu, a);
+      gcalCreateEvent(respId, event).then(ev => {
+        if (ev?.id) showToast('Evento criado no Google Calendar ✓', 'ok');
+      });
+    }
   }
 }
 
@@ -4597,9 +5002,14 @@ function recalcTaxaPresenca(tid) {
 }
 
 // ═══════════════════════════════════════════════════════
-// INIT
+// INIT — primeiro carrega do Supabase, depois renderiza
 // ═══════════════════════════════════════════════════════
-render();
+(async () => {
+  const root = document.getElementById('root');
+  if (root) root.innerHTML = '<div style="display:flex;align-items:center;justify-content:center;min-height:100vh;background:#0c0c12;color:#9fa5bb;font-family:DM Sans,sans-serif;font-size:14px;flex-direction:column;gap:12px"><div style="width:32px;height:32px;border:3px solid #6d28d9;border-top-color:transparent;border-radius:50%;animation:spin 0.8s linear infinite"></div><div>Carregando dados do servidor…</div><style>@keyframes spin{to{transform:rotate(360deg)}}</style></div>';
+  await supaBoot();
+  render();
+})();
 
 // ═══════════════════════════════════════════════════════
 // KANBAN — Situação das Turmas
